@@ -1,7 +1,11 @@
 #include <Arduino.h>
 #include <list>
+#include <string>
+#include <cmath>
 #include <Wifi.h>
 #include <WiFiMulti.h>
+#include "esp_efuse.h"
+#include "driver/ledc.h"
 
 #define WIFI_SSID "VoltageLoop"
 #define WIFI_PASSWORD "Kirchhoff"
@@ -9,10 +13,24 @@
 
 #define WIFI_STATUS_PIN LED_BUILTIN
 
-#define INPUT_0 GPIO_NUM_36
-#define INPUT_1 GPIO_NUM_39
-#define INPUT_2 GPIO_NUM_34
-#define INPUT_3 GPIO_NUM_35
+#define INPUT_0 GPIO_NUM_36 
+#define INPUT_1 GPIO_NUM_39 
+#define INPUT_2 GPIO_NUM_34 
+#define INPUT_3 GPIO_NUM_35 
+
+#define OUTPUT_0_PIN GPIO_NUM_23 // Used for mapping PWM modules to outputs.
+#define OUTPUT_1_PIN GPIO_NUM_22 // ^^
+#define OUTPUT_2_PIN GPIO_NUM_21 // ^
+
+#define OUTPUT_0_PWM LEDC_CHANNEL_0 // Used to write duty cycle to PWM modules / outputs.
+#define OUTPUT_1_PWM LEDC_CHANNEL_1 // ^^ 
+#define OUTPUT_2_PWM LEDC_CHANNEL_2 // ^
+
+#define GPIO_PWM_FREQUENCY 10e3
+#define GPIO_PWM_RESOLUTION 8
+
+int GPIO_PWM_MAX_COUNT = pow(2, GPIO_PWM_RESOLUTION) - 1;
+int GPIO_PWM_DUTY_CYCLES[] = {0, 0, 0};
 
 IPAddress staticIP(192, 168, 1, 100);
 IPAddress gateway(192, 168, 1, 1);
@@ -21,14 +39,33 @@ IPAddress subnet(255, 255, 255, 0);
 WiFiServer Server(TCP_PORT);
 WiFiClient RemoteClient;
 
+String ID_STRING = "ESP32_TCP_SERVER;V0.0.1;ESP0001"; //Name;FW Version;SN
+
+String TCP_COMMAND_TREE = 
+"Commands:                          |\n"
+"HELP?                              | string: This Prompt.\n"
+"*IDN? or ID?                       | Returns id string.\n"
+"GPIO:                              |\n"                           
+"|---IN?                            | int: integer rep of inputs, IN0 = LSB.\n"
+"|---OUT(<channel number>)?         | float: Output duty cycle [0-1].\n"
+"|   OUT(<channel number>) <value>  | float: Sets output duty cycle to <value>\n";
+
 // Function Declarations
 bool ConnectToWifi();
 void ProcessTCP();
+void WriteToClient();
 int ReadInputs();
 
 #pragma region Setup
 void setup() {
     //GPIO Setup
+    
+    //PWM Setup
+    ledcSetup(OUTPUT_0_PWM, GPIO_PWM_FREQUENCY, GPIO_PWM_RESOLUTION); // GPIO Ouput PWM Controllers
+    ledcSetup(OUTPUT_1_PWM, GPIO_PWM_FREQUENCY, GPIO_PWM_RESOLUTION); // ^^
+    ledcSetup(OUTPUT_2_PWM, GPIO_PWM_FREQUENCY, GPIO_PWM_RESOLUTION); // ^
+
+    ledcSetup(4, 50, 16); // Servo PWM Output
     
     //Status Pins
     pinMode(WIFI_STATUS_PIN, OUTPUT); 
@@ -39,9 +76,13 @@ void setup() {
     pinMode(INPUT_2, INPUT);
     pinMode(INPUT_3, INPUT);
 
+    //Output Pins
+    ledcAttachPin(OUTPUT_0_PIN, OUTPUT_0_PWM);
+    ledcAttachPin(OUTPUT_1_PIN, OUTPUT_1_PWM);
+    ledcAttachPin(OUTPUT_2_PIN, OUTPUT_2_PWM);
+
     //GPIO Default Values
     digitalWrite(WIFI_STATUS_PIN, 0);
-
 
     //COM Port To Computer
     Serial.begin(921600);
@@ -99,6 +140,12 @@ int ReadInputs(){
     return ((digitalRead(INPUT_3) << 3) + (digitalRead(INPUT_2) << 2) + (digitalRead(INPUT_1) << 1) + digitalRead(INPUT_0));
 }
 
+void WriteToOutputs() {
+    ledcWrite(OUTPUT_0_PWM, GPIO_PWM_DUTY_CYCLES[0]);
+    ledcWrite(OUTPUT_1_PWM, GPIO_PWM_DUTY_CYCLES[1]);
+    ledcWrite(OUTPUT_2_PWM, GPIO_PWM_DUTY_CYCLES[2]);
+}
+
 #pragma region Wifi Connect
 bool ConnectToWifi() {
     static String wifiName = WIFI_SSID;
@@ -134,9 +181,14 @@ bool ConnectToWifi() {
 
 #pragma region Telnet Server
 
+void WriteToClient(String message) {
+    RemoteClient.print(message + ((message[-1] == '$') ? "" : "$"));
+    Serial.println("[TCP][LOG]: >> " + message);
+}
+
 void InvalidCommand(String command) {
     Serial.println("[TCP][LOG]: Invalid Command Received: " + command);
-    RemoteClient.println("Invalid Command");
+    WriteToClient("Invalid Command");
 }
 
 void ProcessTCP() {
@@ -155,7 +207,7 @@ void ProcessTCP() {
             // We do not currently have a client so accept this one.
             Serial.println("[TCP][LOG]: Connection Accepted: " + newClient.localIP().toString());
             RemoteClient = newClient;
-            RemoteClient.println("ESP32 Server: Connection Accepted");
+            WriteToClient("ESP32 Server: Connection Accepted");
         }
         else { 
             // We already have a remote client to reject this one.
@@ -181,30 +233,55 @@ void ProcessTCP() {
         }
     }
 
-    //Process all of the received commands.
-    // GPIO:
-    // |--- IN
-    // |    |--- Query <"?"> -> Returns in representing input states. (Currently the only one working)
-    // |
-    // |--- OUT
-    //      |--- Query <"?"> -> Returns int representing output states.
-    //      |--- Write <int> -> Sets values according to provided integer.
-    //
+    // See command tree string for command structure.
     while (tcpCommandsToProcess.size() != 0) {
         String command = tcpCommandsToProcess.front();
         std::vector<String> commandComponents = Split(command, commandDelimiters);
         
-        if (commandComponents.at(0) == "GPIO") {
-            if (commandComponents.size() == 1) { InvalidCommand(command); } // No GPIO commands of this depth.
+        if (commandComponents.at(0) == "HELP?") {
+            WriteToClient(TCP_COMMAND_TREE);
+        }
+
+        else if (commandComponents.at(0) == "*IDN?" || commandComponents.at(0) == "ID?") {
+            WriteToClient(ID_STRING);    
+        }
+
+        else if (commandComponents.at(0) == "GPIO") {
+            if (commandComponents.size() < 2) { InvalidCommand(command); } // No GPIO commands of this depth.
+            
             else if (commandComponents.at(1) == "IN?") { //Input State Query
-                String inputValues = (String)ReadInputs();
-                Serial.println("[TCP][LOG]: >> " + inputValues);
-                RemoteClient.println(inputValues); 
-            } 
-            else if (commandComponents.at(1) == "OUT?") {InvalidCommand(command);} //Output State Query
-            else if (commandComponents.at(1).startsWith("OUT")) {InvalidCommand(command);} // Potential Output Set
+                WriteToClient((String)ReadInputs()); 
+            }
+
+            else if (commandComponents.at(1).startsWith("OUT(")) { //Output command
+                
+                int trailingCut = commandComponents.at(1).endsWith("?") ? 2 : 1;
+                String outNumString = commandComponents.at(1).substring(4, commandComponents.at(1).length() - trailingCut);
+                long outputNumber = outNumString.toInt(); // If invalid, will default to 0, will also ignore the ')' for queries
+                if (outputNumber >= 0 && outputNumber <= 2) {
+                    // Valid output selection
+                    if (commandComponents.at(1).endsWith("?")) { //Output Query
+                        float dutyCycle = ((float)GPIO_PWM_DUTY_CYCLES[outputNumber] / (float)GPIO_PWM_MAX_COUNT);
+                        WriteToClient(String(dutyCycle, 4));   
+                    }
+                    else if (commandComponents.size() < 3) {  WriteToClient("No Output Value Detected"); }
+                    else { // Output Write
+                        int value = (int)(commandComponents.at(2).toFloat() * GPIO_PWM_MAX_COUNT); // Will default 0
+                        if (value > GPIO_PWM_MAX_COUNT) {value = GPIO_PWM_MAX_COUNT;}
+                        if (value < 0) {value = 0;}
+                        GPIO_PWM_DUTY_CYCLES[outputNumber] = value;
+                        WriteToOutputs();
+                    }   
+                }
+                else { 
+                    // Invalid output number.
+                    WriteToClient("Invalid Output Number: " + outNumString);
+                }
+            }
+
             else {InvalidCommand(command);}
         }
+
         else {
             InvalidCommand(command);
         }
