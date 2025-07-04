@@ -7,8 +7,10 @@
 #include "esp_efuse.h"
 #include "driver/ledc.h"
 
-#define WIFI_SSID "VoltageLoop"
-#define WIFI_PASSWORD "Kirchhoff"
+// #define WIFI_SSID "VoltageLoop"
+// #define WIFI_PASSWORD "Kirchhoff"
+#define WIFI_SSID "interdimensionalWiFi2.4"
+#define WIFI_PASSWORD "GummyB3ars!*"
 #define TCP_PORT 23
 
 #define WIFI_STATUS_PIN LED_BUILTIN
@@ -40,15 +42,6 @@ WiFiServer Server(TCP_PORT);
 WiFiClient RemoteClient;
 
 String ID_STRING = "ESP32_TCP_SERVER;V0.0.1;ESP0001"; //Name;FW Version;SN
-
-String TCP_COMMAND_TREE = 
-"Commands:                          |\n"
-"HELP?                              | string: This Prompt.\n"
-"*IDN? or ID?                       | Returns id string.\n"
-"GPIO:                              |\n"                           
-"|---IN?                            | int: integer rep of inputs, IN0 = LSB.\n"
-"|---OUT(<channel number>)?         | float: Output duty cycle [0-1].\n"
-"|   OUT(<channel number>) <value>  | float: Sets output duty cycle to <value>\n";
 
 // Function Declarations
 bool ConnectToWifi();
@@ -84,8 +77,12 @@ void setup() {
     //GPIO Default Values
     digitalWrite(WIFI_STATUS_PIN, 0);
 
+    ledcWrite(OUTPUT_0_PWM, 0);
+    ledcWrite(OUTPUT_1_PWM, 0);
+    ledcWrite(OUTPUT_2_PWM, 0);
+
     //COM Port To Computer
-    Serial.begin(921600);
+    Serial.begin(115200);
     Serial.println("\n[GENERAL][ESP PROGRAM START]");
 
     // Wifi & Server Setup
@@ -182,7 +179,7 @@ bool ConnectToWifi() {
 #pragma region Telnet Server
 
 void WriteToClient(String message) {
-    RemoteClient.print(message + ((message[-1] == '$') ? "" : "$"));
+    RemoteClient.println(message);
     Serial.println("[TCP][LOG]: >> " + message);
 }
 
@@ -237,12 +234,8 @@ void ProcessTCP() {
     while (tcpCommandsToProcess.size() != 0) {
         String command = tcpCommandsToProcess.front();
         std::vector<String> commandComponents = Split(command, commandDelimiters);
-        
-        if (commandComponents.at(0) == "HELP?") {
-            WriteToClient(TCP_COMMAND_TREE);
-        }
 
-        else if (commandComponents.at(0) == "*IDN?" || commandComponents.at(0) == "ID?") {
+        if (commandComponents.at(0) == "*IDN?" || commandComponents.at(0) == "ID?") {
             WriteToClient(ID_STRING);    
         }
 
@@ -270,6 +263,9 @@ void ProcessTCP() {
                         if (value > GPIO_PWM_MAX_COUNT) {value = GPIO_PWM_MAX_COUNT;}
                         if (value < 0) {value = 0;}
                         GPIO_PWM_DUTY_CYCLES[outputNumber] = value;
+                        Serial.println(GPIO_PWM_DUTY_CYCLES[0]);
+                        Serial.println(GPIO_PWM_DUTY_CYCLES[1]);
+                        Serial.println(GPIO_PWM_DUTY_CYCLES[2]);
                         WriteToOutputs();
                     }   
                 }
